@@ -758,7 +758,14 @@ class TranslationUnitCache(Worker):
             for compilation_entry in compilation_database_entries:
                 entry = entry + 1
                 self.set_status('Parsing compilation database: %s (%d/%d)' % (filename, entry, total))
-                self.compilation_database[compilation_entry["file"]] = [ p.strip() for p in compilation_database_pattern.findall(compilation_entry["command"]) ]
+                entry_folder = os.path.dirname(compilation_entry["file"])
+                if entry_folder not in self.compilation_database:
+                    self.compilation_database[entry_folder] = []
+
+                self.compilation_database[entry_folder].extend([ p.strip() for p in compilation_database_pattern.findall(compilation_entry["command"]) ])
+
+            for k,v in self.compilation_database.items():
+                self.compilation_database[k] = list(set(self.compilation_database[k]))
 
             self.set_status("Parsing %s done" % filename)
         finally:
@@ -868,10 +875,11 @@ class TranslationUnitCache(Worker):
         return expand_path(get_setting("options_script", "", view), view.window())
 
     def get_opts(self, view, filename):
-        if filename in self.compilation_database:
-            opts = list(self.compilation_database[filename])
+        folder = os.path.dirname(filename)
+        if folder in self.compilation_database:
+            opts = list(self.compilation_database[folder])
         else:
-            self.set_status('%s not in compilation database' % filename)
+            self.set_status('%s not in compilation database' % folder)
             opts = get_path_setting("options", [], view)
 
         if not get_setting("dont_prepend_clang_includes", False, view):
