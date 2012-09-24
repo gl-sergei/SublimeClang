@@ -29,9 +29,11 @@ from ctypes import cdll, Structure, POINTER, c_char_p, c_void_p, c_uint, c_bool
 from parsehelp.parsehelp import *
 import re
 import os
+import json
 
 scriptpath = os.path.dirname(os.path.abspath(__file__))
 
+compilation_database_pattern = re.compile('(?<=\s)-[DIOUWfgs][^=\s]+(?:=\\"[^"]+\\"|=[^"]\S+)?')
 
 def get_cache_library():
     import platform
@@ -650,6 +652,7 @@ class TranslationUnitCache(Worker):
         self.index_parse_options = 13
         self.index = None
         self.debug_options = False
+        self.compilation_database = None
 
     def get_status(self, filename):
         tu = self.translationUnits.lock()
@@ -741,6 +744,33 @@ class TranslationUnitCache(Worker):
         if not on_done is None:
             run_in_main_thread(on_done)
 
+    def task_parse_database(self, data):
+        filename, on_done = data
+        if self.add_busy(filename, self.task_parse_database, data):
+            return
+        try:
+            self.set_status('Parsing compilation database: %s' % filename)
+            with open(filename) as compilation_database_file:
+                compilation_database_entries = json.load(compilation_database_file)
+
+            total = len(compilation_database_entries)
+            entry = 0
+            for compilation_entry in compilation_database_entries:
+                entry = entry + 1
+                self.set_status('Parsing compilation database: %s (%d/%d)' % (filename, entry, total))
+                self.compilation_database[compilation_entry["file"]] = [ p.strip() for p in compilation_database_pattern.findall(compilation_entry["command"]) ]
+
+            self.set_status("Parsing %s done" % filename)
+        finally:
+            l = self.parsingList.lock()
+            try:
+                l.remove(filename)
+            finally:
+                self.parsingList.unlock()
+                self.remove_busy(filename)
+        if not on_done is None:
+            run_in_main_thread(on_done)
+
     def task_clear(self, data):
         tus = self.translationUnits.lock()
         try:
@@ -761,7 +791,29 @@ class TranslationUnitCache(Worker):
         finally:
             self.remove_busy(data)
 
+    def parse_database(self, on_done=None):
+        ret = False
+        self.compilation_database = {}
+
+        filename = expand_path(get_setting("compilation_database", None), None)
+        if filename is not None:
+            pl = self.parsingList.lock()
+            try:
+                if filename not in pl:
+                    ret = True
+                    pl.append(filename)
+                    self.tasks.put((
+                        self.task_parse_database,
+                        (filename, on_done)))
+            finally:
+                self.parsingList.unlock()
+
+        return ret
+
     def reparse(self, view, filename, unsaved_files=[], on_done=None):
+        if self.compilation_database is None:
+            self.parse_database()
+
         ret = False
         pl = self.parsingList.lock()
         try:
@@ -770,12 +822,15 @@ class TranslationUnitCache(Worker):
                 pl.append(filename)
                 self.tasks.put((
                     self.task_reparse,
-                    (filename, self.get_opts(view), self.get_opts_script(view), unsaved_files, on_done)))
+                    (filename, self.get_opts(view, filename), self.get_opts_script(view), unsaved_files, on_done)))
         finally:
             self.parsingList.unlock()
         return ret
 
     def add_ex(self, filename, opts, opts_script, on_done=None):
+        if self.compilation_database is None:
+            self.parse_database()
+
         tu = self.translationUnits.lock()
         pl = self.parsingList.lock()
         try:
@@ -789,13 +844,16 @@ class TranslationUnitCache(Worker):
             self.parsingList.unlock()
 
     def add(self, view, filename, on_done=None):
+        if self.compilation_database is None:
+            self.parse_database()
+
         ret = False
         tu = self.translationUnits.lock()
         pl = self.parsingList.lock()
         try:
             if filename not in tu and filename not in pl:
                 ret = True
-                opts = self.get_opts(view)
+                opts = self.get_opts(view, filename)
                 opts_script = self.get_opts_script(view)
                 pl.append(filename)
                 self.tasks.put((
@@ -809,10 +867,16 @@ class TranslationUnitCache(Worker):
     def get_opts_script(self, view):
         return expand_path(get_setting("options_script", "", view), view.window())
 
-    def get_opts(self, view):
-        opts = get_path_setting("options", [], view)
+    def get_opts(self, view, filename):
+        if filename in self.compilation_database:
+            opts = list(self.compilation_database[filename])
+        else:
+            self.set_status('%s not in compilation database' % filename)
+            opts = get_path_setting("options", [], view)
+
         if not get_setting("dont_prepend_clang_includes", False, view):
             opts.insert(0, "-I%s/clang/include" % scriptpath)
+
         if get_setting("add_language_option", True, view):
             language = get_language(view)
             if language == "objc":
@@ -825,6 +889,7 @@ class TranslationUnitCache(Worker):
             additional_language_options = get_setting("additional_language_options", {}, view)
             if additional_language_options.has_key(language):
                 opts.extend(additional_language_options[language] or [])
+
         self.debug_options = get_setting("debug_options", False)
         self.index_parse_options = get_setting("index_parse_options", 13, view)
         return opts
